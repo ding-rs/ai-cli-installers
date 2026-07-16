@@ -1035,7 +1035,11 @@ function Test-PrivateFile {
     }
 }
 catch {
-    Add-Failure -Message ("test harness stopped unexpectedly: " + $_.Exception.Message)
+    $failureDetails = "test harness stopped unexpectedly: " + $_.Exception.Message
+    if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) {
+        $failureDetails += [Environment]::NewLine + $_.ScriptStackTrace
+    }
+    Add-Failure -Message $failureDetails
 }
 finally {
     Restore-TestEnvironment
