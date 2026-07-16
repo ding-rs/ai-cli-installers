@@ -9,6 +9,15 @@ BLOCK_START='# >>> ai-cli-installers >>>'
 BLOCK_END='# <<< ai-cli-installers <<<'
 TEMP_FILE=
 TTY_ECHO_DISABLED=0
+CONFIG_TRANSACTION_ACTIVE=0
+CLAUDE_CONFIG_TARGET=
+CLAUDE_CONFIG_EXISTED=0
+CLAUDE_CONFIG_BACKUP=
+CLAUDE_CONFIG_MODIFIED=0
+SHELL_RC_TARGET=
+SHELL_RC_EXISTED=0
+SHELL_RC_BACKUP=
+SHELL_RC_MODIFIED=0
 
 usage() {
   cat <<EOF
@@ -47,6 +56,11 @@ restore_tty() {
 
 cleanup() {
   restore_tty
+  if [ "$CONFIG_TRANSACTION_ACTIVE" -eq 1 ]; then
+    if ! rollback_configuration_transaction; then
+      printf 'Error: could not fully roll back Claude configuration; preserved backups were left in place.\n' >&2
+    fi
+  fi
   if [ -n "$TEMP_FILE" ] && [ -e "$TEMP_FILE" ]; then
     rm -f -- "$TEMP_FILE"
   fi
@@ -229,7 +243,7 @@ validate_endpoint() {
 
   [ -n "$endpoint" ] || return 1
   case $endpoint in
-    *'?'*|*'#'*|*[[:space:]]*) return 1 ;;
+    *'?'*|*'#'*|*\\*|*[[:space:]]*|*[[:cntrl:]]*) return 1 ;;
   esac
 
   case $endpoint in
@@ -242,7 +256,7 @@ validate_endpoint() {
   validate_authority "$authority"
 }
 
-validate_endpoint || die 'endpoint must be an exact http:// or https:// URL without userinfo, query, fragment, whitespace, or an empty host'
+validate_endpoint || die 'endpoint must be an exact http:// or https:// URL without userinfo, query, fragment, whitespace, control characters, backslashes, or an empty host'
 [ -n "$api_key" ] || die 'API key must not be empty'
 
 command_exists=0
@@ -277,13 +291,17 @@ fi
 
 if [ "$install_requested" -eq 1 ]; then
   info "Running the official Claude Code installer from $INSTALL_URL ..."
-  if ! curl -fsSL "$INSTALL_URL" | bash; then
+  if ! env -u AI_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN \
+      curl -fsSL "$INSTALL_URL" | \
+      env -u AI_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN bash; then
     die 'the official Claude Code installer failed'
   fi
 
   PATH="$HOME/.local/bin:$HOME/.claude/local/bin:$PATH"
   export PATH
-  if ! command -v claude >/dev/null 2>&1 || ! claude --version >/dev/null 2>&1; then
+  if ! command -v claude >/dev/null 2>&1 || \
+      ! env -u AI_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN \
+        claude --version >/dev/null 2>&1; then
     die 'Claude Code was not available after installation'
   fi
 else
@@ -300,6 +318,74 @@ next_backup_path() {
     suffix=$((suffix + 1))
   done
   printf '%s\n' "$candidate"
+}
+
+begin_configuration_transaction() {
+  CONFIG_TRANSACTION_ACTIVE=1
+  CLAUDE_CONFIG_TARGET=
+  CLAUDE_CONFIG_EXISTED=0
+  CLAUDE_CONFIG_BACKUP=
+  CLAUDE_CONFIG_MODIFIED=0
+  SHELL_RC_TARGET=
+  SHELL_RC_EXISTED=0
+  SHELL_RC_BACKUP=
+  SHELL_RC_MODIFIED=0
+}
+
+rollback_configuration_transaction() {
+  local rollback_failed
+  rollback_failed=0
+
+  [ "$CONFIG_TRANSACTION_ACTIVE" -eq 1 ] || return 0
+
+  if [ "$SHELL_RC_MODIFIED" -eq 1 ] && [ -n "$SHELL_RC_TARGET" ]; then
+    if [ "$SHELL_RC_EXISTED" -eq 1 ]; then
+      if [ -n "$SHELL_RC_BACKUP" ] && [ -f "$SHELL_RC_BACKUP" ]; then
+        cp -p -- "$SHELL_RC_BACKUP" "$SHELL_RC_TARGET" || rollback_failed=1
+      else
+        rollback_failed=1
+      fi
+    else
+      rm -f -- "$SHELL_RC_TARGET" || rollback_failed=1
+    fi
+  fi
+
+  if [ "$CLAUDE_CONFIG_MODIFIED" -eq 1 ] && [ -n "$CLAUDE_CONFIG_TARGET" ]; then
+    if [ "$CLAUDE_CONFIG_EXISTED" -eq 1 ]; then
+      if [ -n "$CLAUDE_CONFIG_BACKUP" ] && [ -f "$CLAUDE_CONFIG_BACKUP" ]; then
+        cp -p -- "$CLAUDE_CONFIG_BACKUP" "$CLAUDE_CONFIG_TARGET" || rollback_failed=1
+      else
+        rollback_failed=1
+      fi
+    else
+      rm -f -- "$CLAUDE_CONFIG_TARGET" || rollback_failed=1
+    fi
+  fi
+
+  CONFIG_TRANSACTION_ACTIVE=0
+  [ "$rollback_failed" -eq 0 ]
+}
+
+commit_configuration_transaction() {
+  CONFIG_TRANSACTION_ACTIVE=0
+}
+
+create_private_backup() {
+  local source_file backup_file previous_umask
+  source_file=$1
+  backup_file=$2
+  previous_umask=$(umask)
+  umask 077
+  if ! cp -- "$source_file" "$backup_file"; then
+    umask "$previous_umask"
+    rm -f -- "$backup_file"
+    return 1
+  fi
+  umask "$previous_umask"
+  if ! chmod 600 "$backup_file"; then
+    rm -f -- "$backup_file"
+    return 1
+  fi
 }
 
 resolve_write_target() {
@@ -336,11 +422,14 @@ merge_claude_json() {
   if ! config_target=$(resolve_write_target "$config_file"); then
     die 'Claude configuration symlink is broken or cyclic; the link was left unchanged'
   fi
+  CLAUDE_CONFIG_TARGET=$config_target
 
   if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+    CLAUDE_CONFIG_EXISTED=1
     [ -f "$config_target" ] || die "$config_file does not resolve to a regular file"
     backup_file=$(next_backup_path "$config_file")
-    cp -p -- "$config_target" "$backup_file" || die 'could not back up the existing Claude configuration'
+    create_private_backup "$config_target" "$backup_file" || die 'could not create an owner-only backup of the existing Claude configuration'
+    CLAUDE_CONFIG_BACKUP=$backup_file
     info 'Backed up the existing Claude configuration.'
   fi
 
@@ -396,7 +485,8 @@ PYTHON
     die 'node or python3 is required to update Claude configuration safely'
   fi
 
-  chmod 600 "$TEMP_FILE" 2>/dev/null || true
+  chmod 600 "$TEMP_FILE" || die 'could not restrict Claude configuration permissions'
+  CLAUDE_CONFIG_MODIFIED=1
   mv -f -- "$TEMP_FILE" "$config_target" || die 'could not replace Claude configuration'
   TEMP_FILE=
 }
@@ -434,18 +524,23 @@ shell_quote() {
 }
 
 update_shell_rc() {
-  local rc_file rc_target quoted_endpoint quoted_key
+  local rc_file rc_target rc_backup quoted_endpoint quoted_key
   rc_file=$(choose_shell_rc)
   if ! rc_target=$(resolve_write_target "$rc_file"); then
     die 'shell rc symlink is broken or cyclic; the link was left unchanged'
   fi
+  SHELL_RC_TARGET=$rc_target
   quoted_endpoint=$(shell_quote "$endpoint")
   quoted_key=$(shell_quote "$api_key")
   TEMP_FILE="$rc_target.ai-cli-installers.tmp.$$"
   rm -f -- "$TEMP_FILE"
 
   if [ -e "$rc_target" ]; then
+    SHELL_RC_EXISTED=1
     [ -f "$rc_target" ] || die 'shell rc does not resolve to a regular file'
+    rc_backup=$(next_backup_path "$rc_file")
+    create_private_backup "$rc_target" "$rc_backup" || die 'could not create an owner-only backup of the existing shell rc file'
+    SHELL_RC_BACKUP=$rc_backup
     if ! awk -v start="$BLOCK_START" -v end="$BLOCK_END" '
       function invalid_layout() {
         invalid = 1
@@ -473,6 +568,8 @@ update_shell_rc() {
     : >"$TEMP_FILE" || die 'could not create a shell rc file'
   fi
 
+  chmod 600 "$TEMP_FILE" || die 'could not restrict shell rc permissions before writing the API key'
+
   {
     printf '%s\n' "$BLOCK_START"
     printf 'export ANTHROPIC_BASE_URL=%s\n' "$quoted_endpoint"
@@ -480,12 +577,15 @@ update_shell_rc() {
     printf '%s\n' "$BLOCK_END"
   } >>"$TEMP_FILE" || die 'could not write the managed shell environment block'
 
-  chmod 600 "$TEMP_FILE" 2>/dev/null || true
+  chmod 600 "$TEMP_FILE" || die 'could not restrict shell rc permissions'
+  SHELL_RC_MODIFIED=1
   mv -f -- "$TEMP_FILE" "$rc_target" || die 'could not replace the shell rc file'
   TEMP_FILE=
   info "Updated the managed environment block in $rc_file."
 }
 
+begin_configuration_transaction
 merge_claude_json
 update_shell_rc
+commit_configuration_transaction
 info 'Claude Code configuration is ready; the API key was stored without being displayed.'

@@ -20,6 +20,14 @@ shell_rc_path() {
   esac
 }
 
+file_mode() {
+  if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
 setup_fake_installer() {
   new_sandbox
   PATH="$FAKE_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -27,9 +35,11 @@ setup_fake_installer() {
 
   FAKE_CURL_LOG=$SANDBOX/curl.log
   FAKE_INSTALL_LOG=$SANDBOX/install.log
+  FAKE_SECRET_ENV_LOG=$SANDBOX/secret-env.log
   : >"$FAKE_CURL_LOG"
   : >"$FAKE_INSTALL_LOG"
-  export FAKE_CURL_LOG FAKE_INSTALL_LOG
+  : >"$FAKE_SECRET_ENV_LOG"
+  export FAKE_CURL_LOG FAKE_INSTALL_LOG FAKE_SECRET_ENV_LOG
 
   make_fake_command installed-claude '#!/bin/sh
 if [ "${1-}" = "--version" ]; then
@@ -40,8 +50,17 @@ exit 0'
 
   make_fake_command curl '#!/bin/sh
 printf "%s\n" "$*" >>"$FAKE_CURL_LOG"
+for secret_name in AI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN; do
+  eval "secret_value=\${$secret_name-}"
+  if [ -n "$secret_value" ]; then
+    printf "curl:%s\n" "$secret_name" >>"$FAKE_SECRET_ENV_LOG"
+  fi
+done
 printf "%s\n" \
   "#!/bin/sh" \
+  "if [ -n \"\${AI_API_KEY-}\" ] || [ -n \"\${ANTHROPIC_API_KEY-}\" ] || [ -n \"\${ANTHROPIC_AUTH_TOKEN-}\" ] || [ -n \"\${CLAUDE_CODE_OAUTH_TOKEN-}\" ]; then" \
+  "  printf \"installer-secret-present\\n\" >>\"\$FAKE_SECRET_ENV_LOG\"" \
+  "fi" \
   "printf \"installer-ran\\n\" >>\"\$FAKE_INSTALL_LOG\"" \
   "cp \"\$FAKE_BIN/installed-claude\" \"\$FAKE_BIN/claude\"" \
   "chmod +x \"\$FAKE_BIN/claude\""'
@@ -87,6 +106,8 @@ RC_FILE=$(shell_rc_path)
 assert_file_contains "$RC_FILE" "export ANTHROPIC_BASE_URL='$ENDPOINT'" 'exact endpoint is written without its trailing slash'
 assert_file_contains "$RC_FILE" "export ANTHROPIC_AUTH_TOKEN='$API_KEY'" 'API key is written to the managed environment block'
 assert_file_contains "$HOME/.claude.json" '"hasCompletedOnboarding": true' 'onboarding is enabled'
+assert_eq '600' "$(file_mode "$RC_FILE")" 'managed shell rc is owner-only'
+assert_eq '600' "$(file_mode "$HOME/.claude.json")" 'Claude JSON is owner-only'
 assert_output_masks_key 'successful install output masks the full API key'
 
 printf '%s\n' 'test: existing command plus --yes skips installer but still configures'
@@ -106,6 +127,21 @@ run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --reinstall -
 assert_success 'forced reinstall succeeds'
 assert_file_contains "$FAKE_INSTALL_LOG" 'installer-ran' 'forced reinstall executes the official installer'
 assert_output_masks_key 'forced reinstall output masks the full API key'
+
+printf '%s\n' 'test: installer fetch and body cannot inherit API key environments'
+setup_fake_installer
+run_capture env \
+  AI_ENDPOINT="$ENDPOINT" \
+  AI_API_KEY="$API_KEY" \
+  ANTHROPIC_API_KEY='upstream-api-key-sentinel' \
+  ANTHROPIC_AUTH_TOKEN='upstream-auth-token-sentinel' \
+  CLAUDE_CODE_OAUTH_TOKEN='oauth-token-sentinel' \
+  AI_INSTALL_YES=1 \
+  bash "$SCRIPT"
+assert_success 'environment-key installation succeeds'
+assert_eq '0' "$(wc -c <"$FAKE_SECRET_ENV_LOG" | tr -d ' ')" 'curl and downloaded installer inherit no API key environment'
+assert_file_contains "$(shell_rc_path)" "export ANTHROPIC_AUTH_TOKEN='$API_KEY'" 'sanitized installer still configures the requested API key afterward'
+assert_output_masks_key 'environment-key install output masks the full API key'
 
 printf '%s\n' 'test: dry-run neither mutates HOME nor invokes installer'
 setup_fake_installer
@@ -142,10 +178,67 @@ printf '%s\n' \
   '# >>> ai-cli-installers >>>' \
   'export AFTER_MARKER=keep' >"$RC_FILE"
 cp "$RC_FILE" "$SANDBOX/original-rc"
+printf '%s\n' '{"theme":"rollback-sentinel","hasCompletedOnboarding":false}' >"$HOME/.claude.json"
+cp "$HOME/.claude.json" "$SANDBOX/original-json"
 run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
 assert_failure 'unmatched managed start marker causes a safe failure'
 assert_files_equal "$SANDBOX/original-rc" "$RC_FILE" 'unmatched managed start marker leaves the shell rc byte-for-byte unchanged'
+assert_files_equal "$SANDBOX/original-json" "$HOME/.claude.json" 'shell rc failure rolls back the JSON change byte-for-byte'
+assert_files_equal "$SANDBOX/original-json" "$HOME/.claude.json.ai-cli-installers.bak" 'shell rc failure preserves the JSON backup'
+assert_files_equal "$SANDBOX/original-rc" "$RC_FILE.ai-cli-installers.bak" 'shell rc failure preserves its pre-change backup'
+assert_eq '600' "$(file_mode "$HOME/.claude.json.ai-cli-installers.bak")" 'JSON rollback backup is owner-only'
+assert_eq '600' "$(file_mode "$RC_FILE.ai-cli-installers.bak")" 'shell rc rollback backup is owner-only'
 assert_output_masks_key 'unmatched-marker failure output masks the full API key'
+
+printf '%s\n' 'test: backup permission failure aborts before replacing either managed file'
+setup_fake_installer
+cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
+RC_FILE=$(shell_rc_path)
+printf '%s\n' 'export BEFORE_BACKUP_FAILURE=keep' >"$RC_FILE"
+printf '%s\n' '{"theme":"backup-permission-sentinel","hasCompletedOnboarding":false}' >"$HOME/.claude.json"
+cp "$RC_FILE" "$SANDBOX/original-rc"
+cp "$HOME/.claude.json" "$SANDBOX/original-json"
+make_fake_command chmod '#!/bin/sh
+last=
+for argument do
+  last=$argument
+done
+case $last in
+  *.ai-cli-installers.bak*) exit 1 ;;
+esac
+exec /bin/chmod "$@"'
+run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
+assert_failure 'backup permission failure aborts configuration'
+assert_files_equal "$SANDBOX/original-json" "$HOME/.claude.json" 'backup permission failure leaves JSON unchanged'
+assert_files_equal "$SANDBOX/original-rc" "$RC_FILE" 'backup permission failure leaves shell rc unchanged'
+assert_not_exists "$HOME/.claude.json.ai-cli-installers.bak" 'failed JSON backup is removed instead of left permissive'
+assert_not_exists "$RC_FILE.ai-cli-installers.bak" 'shell rc backup is not attempted after JSON backup permission failure'
+assert_output_masks_key 'backup permission failure output masks the full API key'
+
+printf '%s\n' 'test: shell rc permission failure rolls back JSON before publishing the key'
+setup_fake_installer
+cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
+RC_FILE=$(shell_rc_path)
+printf '%s\n' 'export BEFORE_RC_PERMISSION_FAILURE=keep' >"$RC_FILE"
+printf '%s\n' '{"theme":"rc-permission-sentinel","hasCompletedOnboarding":false}' >"$HOME/.claude.json"
+cp "$RC_FILE" "$SANDBOX/original-rc"
+cp "$HOME/.claude.json" "$SANDBOX/original-json"
+make_fake_command chmod '#!/bin/sh
+last=
+for argument do
+  last=$argument
+done
+case $last in
+  *.bashrc.ai-cli-installers.tmp.*|*.zshrc.ai-cli-installers.tmp.*) exit 1 ;;
+esac
+exec /bin/chmod "$@"'
+run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
+assert_failure 'shell rc permission failure aborts configuration'
+assert_files_equal "$SANDBOX/original-json" "$HOME/.claude.json" 'shell rc permission failure restores JSON byte-for-byte'
+assert_files_equal "$SANDBOX/original-rc" "$RC_FILE" 'shell rc permission failure leaves rc byte-for-byte unchanged'
+assert_eq '600' "$(file_mode "$HOME/.claude.json.ai-cli-installers.bak")" 'shell rc permission failure retains an owner-only JSON backup'
+assert_eq '600' "$(file_mode "$RC_FILE.ai-cli-installers.bak")" 'shell rc permission failure retains an owner-only rc backup'
+assert_output_masks_key 'shell rc permission failure output masks the full API key'
 
 assert_invalid_marker_layout() {
   local layout_name layout_content
@@ -301,12 +394,17 @@ for INVALID_ENDPOINT in \
   'https://api.example.test/v1#fragment' \
   'https://api.example.test/v 1' \
   'https://api.example.test\evil/v1' \
+  'https://api.example.test/v1\evil' \
+  $'https://api.example.test/v1\001evil' \
+  $'https://api.example.test/v1\177evil' \
   'https:///missing-host'
 do
   setup_fake_installer
-  run_capture bash "$SCRIPT" --endpoint "$INVALID_ENDPOINT" --key "$API_KEY" --yes
+  run_capture bash "$SCRIPT" --endpoint "$INVALID_ENDPOINT" --key "$API_KEY" --dry-run --yes
   assert_failure "invalid endpoint is rejected: $INVALID_ENDPOINT"
   assert_eq '0' "$(wc -c <"$FAKE_CURL_LOG" | tr -d ' ')" "invalid endpoint does not invoke installer: $INVALID_ENDPOINT"
+  assert_not_exists "$(shell_rc_path)" "invalid endpoint does not write shell configuration: $INVALID_ENDPOINT"
+  assert_not_exists "$HOME/.claude.json" "invalid endpoint does not write JSON configuration: $INVALID_ENDPOINT"
   assert_output_masks_key "invalid endpoint output masks the full API key: $INVALID_ENDPOINT"
 done
 
@@ -363,7 +461,7 @@ assert_file_contains "$POWERSHELL_SCRIPT" "'ANTHROPIC_AUTH_TOKEN', \$Key, 'User'
 assert_file_contains "$POWERSHELL_SCRIPT" '.ai-cli-installers.bak' 'PowerShell installer backs up an existing JSON configuration'
 assert_file_contains "$POWERSHELL_SCRIPT" 'ConvertFrom-Json -ErrorAction Stop' 'PowerShell installer parses existing JSON with terminating errors'
 assert_file_contains "$POWERSHELL_SCRIPT" "PSObject.Properties['hasCompletedOnboarding']" 'PowerShell installer merges the onboarding field into the parsed object'
-assert_file_contains "$POWERSHELL_SCRIPT" 'Move-Item -LiteralPath $tempPath -Destination $configPath -Force' 'PowerShell installer atomically replaces JSON from a temporary file'
+assert_file_contains "$POWERSHELL_SCRIPT" '[System.IO.File]::Replace($tempPath, $configTarget, $replacementBackupPath)' 'PowerShell installer atomically replaces the resolved physical JSON target from a private temporary file'
 
 if command -v pwsh >/dev/null 2>&1; then
   printf '%s\n' 'test: PowerShell parser accepts claude-code.ps1'
