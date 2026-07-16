@@ -376,7 +376,24 @@ function New-RelativeSymbolicLink {
     $leaf = Split-Path -Leaf $Path
     Push-Location -LiteralPath $parent
     try {
-        $null = New-Item -ItemType SymbolicLink -Path $leaf -Target $Target -Force
+        if ($script:IsWindowsPlatform) {
+            if ([string]::IsNullOrEmpty($leaf) -or $leaf -notmatch '^[A-Za-z0-9._-]+$') {
+                throw "Unsafe symbolic link leaf for cmd.exe mklink: $leaf"
+            }
+            if ([string]::IsNullOrEmpty($Target) -or
+                [System.IO.Path]::IsPathRooted($Target) -or
+                $Target -notmatch '^[A-Za-z0-9._/\\-]+$') {
+                throw "Unsafe relative symbolic link target for cmd.exe mklink: $Target"
+            }
+
+            $null = & cmd.exe /d /c mklink $leaf $Target 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "cmd.exe mklink failed with exit code ${LASTEXITCODE}: $leaf -> $Target"
+            }
+        }
+        else {
+            $null = New-Item -ItemType SymbolicLink -Path $leaf -Target $Target -Force
+        }
     }
     finally {
         Pop-Location
