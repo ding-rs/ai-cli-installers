@@ -334,6 +334,10 @@ function Resolve-ClaudeConfigurationPath {
                         Existed = $false
                     }
                 }
+                $parentEntryIsReparsePoint = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+                if ($parentEntryIsReparsePoint) {
+                    throw 'Claude configuration reparse point target could not be resolved safely; no installation or configuration was changed.'
+                }
             }
             else {
                 throw
@@ -342,9 +346,14 @@ function Resolve-ClaudeConfigurationPath {
 
         $isReparsePoint = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
         if ($isReparsePoint) {
-            $targets = @($item.Target)
+            try {
+                $targets = @($item.Target)
+            }
+            catch {
+                throw 'Claude configuration reparse point target could not be resolved safely; no installation or configuration was changed.'
+            }
             if ($targets.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$targets[0])) {
-                throw 'Claude configuration reparse point target could not be resolved safely.'
+                throw 'Claude configuration reparse point target could not be resolved safely; no installation or configuration was changed.'
             }
             $target = [string]$targets[0]
             if ([System.IO.Path]::IsPathRooted($target)) {

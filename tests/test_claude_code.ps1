@@ -230,10 +230,11 @@ function Get-TestPathEntryFromParent {
     return $null
 }
 
-function Assert-SymbolicLinkTarget {
+function Assert-SymbolicLinkSnapshot {
     param(
         [string]$Path,
-        [string]$ExpectedTarget,
+        [pscustomobject]$ExpectedSnapshot,
+        [switch]$RequireTarget,
         [string]$Message
     )
 
@@ -243,8 +244,24 @@ function Assert-SymbolicLinkTarget {
             throw "Link entry is missing: $Path"
         }
         $isLink = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-        $target = [string]$item.Target
-        Assert-True -Condition ($isLink -and $target -ceq $ExpectedTarget) -Message $Message
+        Assert-True -Condition $isLink -Message $Message
+        if (-not $isLink) {
+            return
+        }
+        try {
+            $target = [string]$item.Target
+            if ($ExpectedSnapshot.TargetReadable) {
+                Assert-Equal -Expected $ExpectedSnapshot.Target -Actual $target -Message $Message
+            }
+            else {
+                Assert-Equal -Expected $ExpectedSnapshot.RequestedTarget -Actual $target -Message $Message
+            }
+        }
+        catch {
+            if ($RequireTarget) {
+                Add-Failure -Message $Message
+            }
+        }
     }
     catch {
         Add-Failure -Message $Message
@@ -368,7 +385,23 @@ function New-RelativeSymbolicLink {
     if ($null -eq $linkItem) {
         throw "Created link entry is missing: $Path"
     }
-    return [string]$linkItem.Target
+    $isLink = ($linkItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    if (-not $isLink) {
+        throw "Created path is not a reparse point: $Path"
+    }
+    $targetReadable = $true
+    $capturedTarget = $null
+    try {
+        $capturedTarget = [string]$linkItem.Target
+    }
+    catch {
+        $targetReadable = $false
+    }
+    return [PSCustomObject]@{
+        TargetReadable = $targetReadable
+        Target = $capturedTarget
+        RequestedTarget = $Target
+    }
 }
 
 function New-TestSandbox {
@@ -796,14 +829,14 @@ function Test-PrivateFile {
     $physicalTarget = Join-Path -Path $sandbox.Home -ChildPath $relativeTarget
     $originalJson = '{"theme":"relative-link","nested":{"keep":23},"hasCompletedOnboarding":false}'
     [System.IO.File]::WriteAllText($physicalTarget, $originalJson)
-    $createdLinkTarget = New-RelativeSymbolicLink -Path $sandbox.Config -Target $relativeTarget
+    $createdLinkSnapshot = New-RelativeSymbolicLink -Path $sandbox.Config -Target $relativeTarget
     $result = Invoke-Subject -Parameters @{
         Endpoint = $endpoint
         Key = $script:UniqueKey
         Yes = $true
     } -HomePath $sandbox.Home
     Assert-InvocationSucceeded -Result $result -Message 'relative config symlink invocation succeeds'
-    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $createdLinkTarget -Message 'relative config symlink remains unchanged'
+    Assert-SymbolicLinkSnapshot -Path $sandbox.Config -ExpectedSnapshot $createdLinkSnapshot -RequireTarget -Message 'relative config symlink remains unchanged'
     $linkedConfig = [System.IO.File]::ReadAllText($physicalTarget) | ConvertFrom-Json
     Assert-Equal -Expected 'relative-link' -Actual $linkedConfig.theme -Message 'relative symlink target preserves unrelated JSON'
     Assert-Equal -Expected 23 -Actual $linkedConfig.nested.keep -Message 'relative symlink target preserves nested JSON'
@@ -813,7 +846,7 @@ function Test-PrivateFile {
 
     Write-Host 'test: broken and cyclic config symlinks fail before installer or writes'
     $sandbox = New-TestSandbox
-    $brokenLinkTarget = New-RelativeSymbolicLink -Path $sandbox.Config -Target 'dotfiles/missing-claude.json'
+    $brokenLinkSnapshot = New-RelativeSymbolicLink -Path $sandbox.Config -Target 'dotfiles/missing-claude.json'
     $result = Invoke-Subject -Parameters @{
         Endpoint = $endpoint
         Key = $script:UniqueKey
@@ -822,13 +855,13 @@ function Test-PrivateFile {
     Assert-False -Condition $result.Succeeded -Message 'broken config symlink fails closed'
     Assert-FileEmpty -Path $sandbox.FetchLog -Message 'broken config symlink is rejected before installer fetch'
     Assert-FileEmpty -Path $sandbox.InstallLog -Message 'broken config symlink is rejected before installer execution'
-    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $brokenLinkTarget -Message 'broken config symlink remains unchanged'
+    Assert-SymbolicLinkSnapshot -Path $sandbox.Config -ExpectedSnapshot $brokenLinkSnapshot -Message 'broken config symlink remains unchanged'
     Assert-KeyMasked -Result $result -Message 'broken config symlink output masks the full key'
 
     $sandbox = New-TestSandbox
     $cyclePartner = Join-Path -Path $sandbox.Home -ChildPath 'cycle-partner'
-    $cycleConfigTarget = New-RelativeSymbolicLink -Path $sandbox.Config -Target 'cycle-partner'
-    $cyclePartnerTarget = New-RelativeSymbolicLink -Path $cyclePartner -Target '.claude.json'
+    $cycleConfigSnapshot = New-RelativeSymbolicLink -Path $sandbox.Config -Target 'cycle-partner'
+    $cyclePartnerSnapshot = New-RelativeSymbolicLink -Path $cyclePartner -Target '.claude.json'
     $result = Invoke-Subject -Parameters @{
         Endpoint = $endpoint
         Key = $script:UniqueKey
@@ -837,8 +870,8 @@ function Test-PrivateFile {
     Assert-False -Condition $result.Succeeded -Message 'cyclic config symlink fails closed'
     Assert-FileEmpty -Path $sandbox.FetchLog -Message 'cyclic config symlink is rejected before installer fetch'
     Assert-FileEmpty -Path $sandbox.InstallLog -Message 'cyclic config symlink is rejected before installer execution'
-    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $cycleConfigTarget -Message 'cyclic config symlink remains unchanged'
-    Assert-SymbolicLinkTarget -Path $cyclePartner -ExpectedTarget $cyclePartnerTarget -Message 'cyclic config symlink partner remains unchanged'
+    Assert-SymbolicLinkSnapshot -Path $sandbox.Config -ExpectedSnapshot $cycleConfigSnapshot -Message 'cyclic config symlink remains unchanged'
+    Assert-SymbolicLinkSnapshot -Path $cyclePartner -ExpectedSnapshot $cyclePartnerSnapshot -Message 'cyclic config symlink partner remains unchanged'
     Assert-KeyMasked -Result $result -Message 'cyclic config symlink output masks the full key'
 
     Write-Host 'test: environment failure restores a symlink physical target and preserves the link'
@@ -850,7 +883,7 @@ function Test-PrivateFile {
     $physicalTarget = Join-Path -Path $sandbox.Home -ChildPath $relativeTarget
     $originalJson = '{"theme":"symlink-rollback","hasCompletedOnboarding":false}'
     [System.IO.File]::WriteAllText($physicalTarget, $originalJson)
-    $rollbackLinkTarget = New-RelativeSymbolicLink -Path $sandbox.Config -Target $relativeTarget
+    $rollbackLinkSnapshot = New-RelativeSymbolicLink -Path $sandbox.Config -Target $relativeTarget
     $faultInjectedSubject = Join-Path -Path $sandbox.Root -ChildPath 'claude-code-symlink-environment-failure.ps1'
     $subjectSource = [System.IO.File]::ReadAllText($script:SubjectPath)
     $lastEnvironmentWrite = "[Environment]::SetEnvironmentVariable('ANTHROPIC_AUTH_TOKEN', `$Key, 'User')"
@@ -862,7 +895,7 @@ function Test-PrivateFile {
         Yes = $true
     } -HomePath $sandbox.Home -TargetPath $faultInjectedSubject
     Assert-False -Condition $result.Succeeded -Message 'symlink environment failure aborts configuration'
-    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $rollbackLinkTarget -Message 'symlink environment rollback preserves the logical link'
+    Assert-SymbolicLinkSnapshot -Path $sandbox.Config -ExpectedSnapshot $rollbackLinkSnapshot -RequireTarget -Message 'symlink environment rollback preserves the logical link'
     Assert-Equal -Expected $originalJson -Actual ([System.IO.File]::ReadAllText($physicalTarget)) -Message 'symlink environment rollback restores the physical target byte-for-byte'
     Assert-KeyMasked -Result $result -Message 'symlink environment rollback output masks the full key'
 
