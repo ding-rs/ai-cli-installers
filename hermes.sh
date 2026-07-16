@@ -313,7 +313,70 @@ case $api_key in
   *[![:print:]]*|*"$dotenv_expansion_prefix"*) die 'API key must contain only printable ASCII characters that are safe in dotenv format' ;;
 esac
 
-HERMES_HOME=${HERMES_HOME:-$HOME/.hermes}
+normalize_directory_destination() {
+  local raw absolute cleaned current suffix segment parent resolved physical_pwd
+  raw=$1
+  [ -n "$raw" ] || return 1
+  case $raw in
+    *[[:cntrl:]]*) return 1 ;;
+  esac
+  case /$raw/ in
+    */../*) return 1 ;;
+  esac
+  physical_pwd=$(pwd -P) || return 1
+  case $raw in
+    /*) absolute=$raw ;;
+    *) absolute=$physical_pwd/$raw ;;
+  esac
+  while :; do
+    cleaned=${absolute//\/\//\/}
+    cleaned=${cleaned//\/\.\//\/}
+    [ "$cleaned" != "$absolute" ] || break
+    absolute=$cleaned
+  done
+  case $absolute in
+    */.) absolute=${absolute%/.} ;;
+  esac
+  while [ "$absolute" != / ] && [ "${absolute%/}" != "$absolute" ]; do
+    absolute=${absolute%/}
+  done
+  current=$absolute
+  suffix=
+  while [ ! -e "$current" ] && [ ! -L "$current" ]; do
+    segment=${current##*/}
+    [ -n "$segment" ] || return 1
+    suffix=/$segment$suffix
+    parent=${current%/*}
+    [ -n "$parent" ] || parent=/
+    [ "$parent" != "$current" ] || return 1
+    current=$parent
+  done
+  if [ -L "$current" ] && [ ! -e "$current" ]; then
+    return 1
+  fi
+  [ -d "$current" ] || return 1
+  resolved=$(CDPATH='' cd -P -- "$current" 2>/dev/null && pwd -P) || return 1
+  printf '%s%s\n' "$resolved" "$suffix"
+}
+
+raw_hermes_home=${HERMES_HOME:-$HOME/.hermes}
+case $raw_hermes_home in
+  /|.|./|..|'') die 'HERMES_HOME must name a dedicated directory, not root, HOME, or the current directory' ;;
+esac
+if ! normalized_hermes_home=$(normalize_directory_destination "$raw_hermes_home"); then
+  die 'HERMES_HOME must be a safe directory path without parent traversal'
+fi
+[ "$normalized_hermes_home" != / ] || die 'HERMES_HOME must not resolve to root'
+physical_pwd=$(pwd -P) || die 'could not resolve the current directory safely'
+physical_home=
+if [ -n "${HOME-}" ] && [ -d "$HOME" ]; then
+  physical_home=$(CDPATH='' cd -P -- "$HOME" 2>/dev/null && pwd -P) || die 'could not resolve HOME safely'
+fi
+[ "$normalized_hermes_home" != "$physical_pwd" ] || die 'HERMES_HOME must not resolve to the current directory'
+if [ -n "$physical_home" ] && [ "$normalized_hermes_home" = "$physical_home" ]; then
+  die 'HERMES_HOME must not resolve to HOME itself'
+fi
+HERMES_HOME=$normalized_hermes_home
 export HERMES_HOME
 config_file=$HERMES_HOME/config.yaml
 env_file=$HERMES_HOME/.env

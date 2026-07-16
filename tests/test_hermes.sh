@@ -238,6 +238,63 @@ assert_failure 'unwritable HERMES_HOME fails preflight'
 assert_eq '0' "$(wc -c <"$FAKE_CURL_LOG" | tr -d ' ')" 'unwritable HERMES_HOME does not fetch installer'
 chmod 700 "$HERMES_HOME"
 
+printf '%s\n' 'test: dangerous HERMES_HOME destinations fail before mkdir, chmod, or installer fetch'
+for DANGEROUS_KIND in root dot dot-slash traversal home pwd home-link pwd-link home-parent-link pwd-parent-link; do
+  setup_fake_hermes
+  install_existing_hermes
+  case $DANGEROUS_KIND in
+    root) DANGEROUS_HOME=/ ;;
+    dot) DANGEROUS_HOME=. ;;
+    dot-slash) DANGEROUS_HOME=./ ;;
+    traversal) DANGEROUS_HOME=$SANDBOX/state/../escape ;;
+    home) DANGEROUS_HOME=$HOME ;;
+    pwd) DANGEROUS_HOME=$(pwd -P) ;;
+    home-link)
+      ln -s "$HOME" "$SANDBOX/home-link"
+      DANGEROUS_HOME=$SANDBOX/home-link
+      ;;
+    pwd-link)
+      ln -s "$(pwd -P)" "$SANDBOX/pwd-link"
+      DANGEROUS_HOME=$SANDBOX/pwd-link
+      ;;
+    home-parent-link)
+      ln -s "${HOME%/*}" "$SANDBOX/home-parent-link"
+      DANGEROUS_HOME=$SANDBOX/home-parent-link/${HOME##*/}
+      ;;
+    pwd-parent-link)
+      PHYSICAL_PWD=$(pwd -P)
+      ln -s "${PHYSICAL_PWD%/*}" "$SANDBOX/pwd-parent-link"
+      DANGEROUS_HOME=$SANDBOX/pwd-parent-link/${PHYSICAL_PWD##*/}
+      ;;
+  esac
+  FAKE_MUTATION_LOG=$SANDBOX/mutation.log
+  : >"$FAKE_MUTATION_LOG"
+  export FAKE_MUTATION_LOG
+  make_fake_command mkdir '#!/bin/sh
+printf "mkdir %s\n" "$*" >>"$FAKE_MUTATION_LOG"
+exit 97'
+  make_fake_command chmod '#!/bin/sh
+printf "chmod %s\n" "$*" >>"$FAKE_MUTATION_LOG"
+exit 98'
+  run_capture env HERMES_HOME="$DANGEROUS_HOME" AI_ENDPOINT="$ENDPOINT" AI_API_KEY="$API_KEY" AI_MODEL="$MODEL" AI_INSTALL_YES=1 bash "$SCRIPT" --provider-id "$PROVIDER"
+  assert_failure "dangerous HERMES_HOME is rejected: $DANGEROUS_KIND"
+  assert_eq '0' "$(wc -c <"$FAKE_MUTATION_LOG" | tr -d ' ')" "dangerous HERMES_HOME triggers no mkdir or chmod: $DANGEROUS_KIND"
+  assert_eq '0' "$(wc -c <"$FAKE_CURL_LOG" | tr -d ' ')" "dangerous HERMES_HOME triggers no installer fetch: $DANGEROUS_KIND"
+done
+
+printf '%s\n' 'test: a relative dedicated HERMES_HOME is physically normalized without changing config paths'
+setup_fake_hermes
+install_existing_hermes
+RUN_CWD=$SANDBOX/work
+mkdir -p "$RUN_CWD"
+run_capture env HERMES_HOME=relative-hermes AI_ENDPOINT="$ENDPOINT" AI_API_KEY="$API_KEY" AI_MODEL="$MODEL" AI_INSTALL_YES=1 \
+  bash -c 'cd "$1" && exec bash "$2" --provider-id "$3"' _ "$RUN_CWD" "$SCRIPT" "$PROVIDER"
+NORMALIZED_HERMES_HOME=$(CDPATH='' cd -P -- "$RUN_CWD" && pwd -P)/relative-hermes
+assert_success 'relative dedicated HERMES_HOME remains supported'
+assert_file_contains "$FAKE_CHILD_LOG" "HERMES_HOME=$NORMALIZED_HERMES_HOME" 'Hermes children receive the physical absolute HERMES_HOME'
+assert_file_contains "$NORMALIZED_HERMES_HOME/config.yaml" "providers.$PROVIDER.api" 'relative HERMES_HOME keeps the config.yaml location'
+assert_file_contains "$NORMALIZED_HERMES_HOME/.env" "$KEY_ENV=" 'relative HERMES_HOME keeps the dotenv secret location'
+
 printf '%s\n' 'test: backups precede the official installer and preserve pre-installer bytes'
 setup_fake_hermes
 mkdir -p "$HERMES_HOME"
