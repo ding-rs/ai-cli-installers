@@ -113,7 +113,13 @@ function Protect-PrivateFile {
         Set-Acl -LiteralPath $Path -AclObject $acl
     }
     else {
-        $chmodCommand = Get-Command -Name 'chmod' -CommandType Application -ErrorAction Stop
+        $chmodCommands = @(Get-Command -Name 'chmod' -CommandType Application -ErrorAction Stop)
+        $chmodCommand = $chmodCommands[0]
+        if ($null -eq $chmodCommand -or
+            $chmodCommand -isnot [System.Management.Automation.ApplicationInfo] -or
+            [string]::IsNullOrWhiteSpace([string]$chmodCommand.Source)) {
+            throw 'Could not locate a single chmod application.'
+        }
         & $chmodCommand.Source '600' $Path
         if ($LASTEXITCODE -ne 0) {
             throw 'Could not restrict private file permissions.'

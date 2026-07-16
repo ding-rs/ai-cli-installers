@@ -333,7 +333,16 @@ function New-RelativeSymbolicLink {
         [string]$Target
     )
 
-    $null = New-Item -ItemType SymbolicLink -Path $Path -Target $Target -Force
+    $parent = Split-Path -Parent $Path
+    $leaf = Split-Path -Leaf $Path
+    Push-Location -LiteralPath $parent
+    try {
+        $null = New-Item -ItemType SymbolicLink -Path $leaf -Target $Target -Force
+    }
+    finally {
+        Pop-Location
+    }
+    return [string](Get-Item -LiteralPath $Path -Force).Target
 }
 
 function New-TestSandbox {
@@ -543,6 +552,27 @@ try {
     Assert-PathExists -Path $sandbox.Config -Message 'installer skip still writes Claude configuration'
     Assert-KeyMasked -Result $result -Message 'existing-command output masks the full key'
 
+    if (-not $script:IsWindowsPlatform) {
+        Write-Host 'test: multiple chmod applications on PATH still select one executable'
+        $sandbox = New-TestSandbox
+        New-FakeClaudeCommand -BinPath $sandbox.Bin
+        $chmodA = Join-Path -Path $sandbox.Root -ChildPath 'chmod-a'
+        $chmodB = Join-Path -Path $sandbox.Root -ChildPath 'chmod-b'
+        $null = New-Item -ItemType Directory -Path $chmodA, $chmodB -Force
+        Copy-Item -LiteralPath '/bin/chmod' -Destination (Join-Path -Path $chmodA -ChildPath 'chmod')
+        Copy-Item -LiteralPath '/bin/chmod' -Destination (Join-Path -Path $chmodB -ChildPath 'chmod')
+        & /bin/chmod 755 (Join-Path -Path $chmodA -ChildPath 'chmod') (Join-Path -Path $chmodB -ChildPath 'chmod')
+        $duplicateChmodPath = $chmodA + [System.IO.Path]::PathSeparator + $chmodB + [System.IO.Path]::PathSeparator + $env:PATH
+        [Environment]::SetEnvironmentVariable('PATH', $duplicateChmodPath, 'Process')
+        [Environment]::SetEnvironmentVariable('Path', $duplicateChmodPath, 'Process')
+        $powerShellExecutable = (Get-Process -Id $PID).Path
+        $childOutput = & $powerShellExecutable -NoLogo -NoProfile -NonInteractive -File $script:SubjectPath -Endpoint $endpoint -Key $script:UniqueKey -Yes *>&1
+        $childExitCode = $LASTEXITCODE
+        Assert-Equal -Expected 0 -Actual $childExitCode -Message 'multiple chmod PATH invocation succeeds in a fresh PowerShell process'
+        Assert-PrivateFile -Path $sandbox.Config -Message 'multiple chmod PATH invocation still creates a private config'
+        Assert-False -Condition ((($childOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Contains($script:UniqueKey)) -Message 'multiple chmod PATH output masks the full key'
+    }
+
     Write-Host 'test: existing Claude plus -Reinstall -Yes invokes installer'
     $sandbox = New-TestSandbox
     New-FakeClaudeCommand -BinPath $sandbox.Bin
@@ -706,7 +736,14 @@ function Test-PrivateFile {
     $finalPermissionFailure = @'
     if ($Path -ceq $env:FAKE_FINAL_TARGET -and (Test-Path -LiteralPath $Path)) {
         $candidate = [System.IO.File]::ReadAllText($Path)
-        if ($candidate.Contains('"hasCompletedOnboarding": true')) { return $false }
+        try {
+            $parsedCandidate = $candidate | ConvertFrom-Json -ErrorAction Stop
+            if ($null -ne $parsedCandidate.PSObject.Properties['hasCompletedOnboarding'] -and
+                $parsedCandidate.hasCompletedOnboarding -eq $true) {
+                return $false
+            }
+        }
+        catch { }
     }
 '@
     $faultInjectedSource = $subjectSource.Replace($privateTestHeader, $privateTestHeader + $finalPermissionFailure)
@@ -733,14 +770,14 @@ function Test-PrivateFile {
     $physicalTarget = Join-Path -Path $sandbox.Home -ChildPath $relativeTarget
     $originalJson = '{"theme":"relative-link","nested":{"keep":23},"hasCompletedOnboarding":false}'
     [System.IO.File]::WriteAllText($physicalTarget, $originalJson)
-    New-RelativeSymbolicLink -Path $sandbox.Config -Target $relativeTarget
+    $createdLinkTarget = New-RelativeSymbolicLink -Path $sandbox.Config -Target $relativeTarget
     $result = Invoke-Subject -Parameters @{
         Endpoint = $endpoint
         Key = $script:UniqueKey
         Yes = $true
     } -HomePath $sandbox.Home
     Assert-InvocationSucceeded -Result $result -Message 'relative config symlink invocation succeeds'
-    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $relativeTarget -Message 'relative config symlink remains unchanged'
+    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $createdLinkTarget -Message 'relative config symlink remains unchanged'
     $linkedConfig = [System.IO.File]::ReadAllText($physicalTarget) | ConvertFrom-Json
     Assert-Equal -Expected 'relative-link' -Actual $linkedConfig.theme -Message 'relative symlink target preserves unrelated JSON'
     Assert-Equal -Expected 23 -Actual $linkedConfig.nested.keep -Message 'relative symlink target preserves nested JSON'
@@ -750,7 +787,7 @@ function Test-PrivateFile {
 
     Write-Host 'test: broken and cyclic config symlinks fail before installer or writes'
     $sandbox = New-TestSandbox
-    New-RelativeSymbolicLink -Path $sandbox.Config -Target 'dotfiles/missing-claude.json'
+    $brokenLinkTarget = New-RelativeSymbolicLink -Path $sandbox.Config -Target 'dotfiles/missing-claude.json'
     $result = Invoke-Subject -Parameters @{
         Endpoint = $endpoint
         Key = $script:UniqueKey
@@ -759,13 +796,13 @@ function Test-PrivateFile {
     Assert-False -Condition $result.Succeeded -Message 'broken config symlink fails closed'
     Assert-FileEmpty -Path $sandbox.FetchLog -Message 'broken config symlink is rejected before installer fetch'
     Assert-FileEmpty -Path $sandbox.InstallLog -Message 'broken config symlink is rejected before installer execution'
-    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget 'dotfiles/missing-claude.json' -Message 'broken config symlink remains unchanged'
+    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $brokenLinkTarget -Message 'broken config symlink remains unchanged'
     Assert-KeyMasked -Result $result -Message 'broken config symlink output masks the full key'
 
     $sandbox = New-TestSandbox
     $cyclePartner = Join-Path -Path $sandbox.Home -ChildPath 'cycle-partner'
-    New-RelativeSymbolicLink -Path $sandbox.Config -Target 'cycle-partner'
-    New-RelativeSymbolicLink -Path $cyclePartner -Target '.claude.json'
+    $cycleConfigTarget = New-RelativeSymbolicLink -Path $sandbox.Config -Target 'cycle-partner'
+    $cyclePartnerTarget = New-RelativeSymbolicLink -Path $cyclePartner -Target '.claude.json'
     $result = Invoke-Subject -Parameters @{
         Endpoint = $endpoint
         Key = $script:UniqueKey
@@ -774,8 +811,8 @@ function Test-PrivateFile {
     Assert-False -Condition $result.Succeeded -Message 'cyclic config symlink fails closed'
     Assert-FileEmpty -Path $sandbox.FetchLog -Message 'cyclic config symlink is rejected before installer fetch'
     Assert-FileEmpty -Path $sandbox.InstallLog -Message 'cyclic config symlink is rejected before installer execution'
-    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget 'cycle-partner' -Message 'cyclic config symlink remains unchanged'
-    Assert-SymbolicLinkTarget -Path $cyclePartner -ExpectedTarget '.claude.json' -Message 'cyclic config symlink partner remains unchanged'
+    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $cycleConfigTarget -Message 'cyclic config symlink remains unchanged'
+    Assert-SymbolicLinkTarget -Path $cyclePartner -ExpectedTarget $cyclePartnerTarget -Message 'cyclic config symlink partner remains unchanged'
     Assert-KeyMasked -Result $result -Message 'cyclic config symlink output masks the full key'
 
     Write-Host 'test: environment failure restores a symlink physical target and preserves the link'
@@ -787,7 +824,7 @@ function Test-PrivateFile {
     $physicalTarget = Join-Path -Path $sandbox.Home -ChildPath $relativeTarget
     $originalJson = '{"theme":"symlink-rollback","hasCompletedOnboarding":false}'
     [System.IO.File]::WriteAllText($physicalTarget, $originalJson)
-    New-RelativeSymbolicLink -Path $sandbox.Config -Target $relativeTarget
+    $rollbackLinkTarget = New-RelativeSymbolicLink -Path $sandbox.Config -Target $relativeTarget
     $faultInjectedSubject = Join-Path -Path $sandbox.Root -ChildPath 'claude-code-symlink-environment-failure.ps1'
     $subjectSource = [System.IO.File]::ReadAllText($script:SubjectPath)
     $lastEnvironmentWrite = "[Environment]::SetEnvironmentVariable('ANTHROPIC_AUTH_TOKEN', `$Key, 'User')"
@@ -799,7 +836,7 @@ function Test-PrivateFile {
         Yes = $true
     } -HomePath $sandbox.Home -TargetPath $faultInjectedSubject
     Assert-False -Condition $result.Succeeded -Message 'symlink environment failure aborts configuration'
-    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $relativeTarget -Message 'symlink environment rollback preserves the logical link'
+    Assert-SymbolicLinkTarget -Path $sandbox.Config -ExpectedTarget $rollbackLinkTarget -Message 'symlink environment rollback preserves the logical link'
     Assert-Equal -Expected $originalJson -Actual ([System.IO.File]::ReadAllText($physicalTarget)) -Message 'symlink environment rollback restores the physical target byte-for-byte'
     Assert-KeyMasked -Result $result -Message 'symlink environment rollback output masks the full key'
 
