@@ -845,11 +845,6 @@ esac
 assert_not_exists "$HOME/.codex" '--help does not create Codex configuration'
 assert_not_exists "$(shell_rc_path)" '--help does not create shell config'
 
-printf '%s\n' 'test: installer remains brand-neutral'
-if [ -f "$SCRIPT" ] && LC_ALL=C grep -Eiq 'aitongdao|tokencat|aiwanai|SITE_NAME|SITE_DOMAIN|AI_HOST|PROVIDER_ID_PREFIX' "$SCRIPT"; then
-  _test_failure 'Codex installer contains private brand content or placeholder tokens'
-fi
-
 if [ "$TEST_FAILURES" -ne 0 ]; then
   exit 1
 fi

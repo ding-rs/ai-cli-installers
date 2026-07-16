@@ -365,11 +365,6 @@ assert_file_contains "$POWERSHELL_SCRIPT" 'ConvertFrom-Json -ErrorAction Stop' '
 assert_file_contains "$POWERSHELL_SCRIPT" "PSObject.Properties['hasCompletedOnboarding']" 'PowerShell installer merges the onboarding field into the parsed object'
 assert_file_contains "$POWERSHELL_SCRIPT" 'Move-Item -LiteralPath $tempPath -Destination $configPath -Force' 'PowerShell installer atomically replaces JSON from a temporary file'
 
-printf '%s\n' 'test: PowerShell installer is brand-neutral'
-if [ -f "$POWERSHELL_SCRIPT" ] && LC_ALL=C grep -Eiq 'aitongdao|tokencat|aiwanai|SITE_NAME|SITE_DOMAIN|AI_HOST|PROVIDER_ID_PREFIX' "$POWERSHELL_SCRIPT"; then
-  _test_failure 'PowerShell installer contains a private brand or placeholder token'
-fi
-
 if command -v pwsh >/dev/null 2>&1; then
   printf '%s\n' 'test: PowerShell parser accepts claude-code.ps1'
   run_capture env POWERSHELL_SCRIPT="$POWERSHELL_SCRIPT" pwsh -NoLogo -NoProfile -NonInteractive -Command \

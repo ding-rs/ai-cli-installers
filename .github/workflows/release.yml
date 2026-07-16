@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Bash and ShellCheck
+            os: ubuntu-latest
+            kind: bash-linux
+          - name: Bash 3.2
+            os: macos-latest
+            kind: bash-macos
+          - name: PowerShell 7
+            os: ubuntu-latest
+            kind: powershell7
+          - name: Windows PowerShell 5.1
+            os: windows-latest
+            kind: windows-powershell
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install ShellCheck
+        if: matrix.kind == 'bash-linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+      - name: Run Linux Bash gates
+        if: matrix.kind == 'bash-linux'
+        run: |
+          bash tests/run.sh
+          bash -n ./*.sh tests/*.sh
+          shellcheck ./*.sh tests/*.sh
+      - name: Run macOS Bash 3.2 gates
+        if: matrix.kind == 'bash-macos'
+        run: |
+          bash --version
+          bash tests/run.sh
+          bash -n ./*.sh tests/*.sh
+      - name: Run PowerShell 7 behavior and parser tests
+        if: matrix.kind == 'powershell7'
+        run: pwsh -NoLogo -NoProfile -NonInteractive -File tests/test_claude_code.ps1
+      - name: Run Windows PowerShell 5.1 behavior and parser tests
+        if: matrix.kind == 'windows-powershell'
+        shell: powershell
+        run: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/test_claude_code.ps1
+
+  release:
+    name: Create GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Create checksums and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          assets=(
+            claude-code.sh
+            claude-code.ps1
+            codex.sh
+            hermes.sh
+            openclaw.sh
+          )
+          sha256sum "${assets[@]}" > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" SHA256SUMS --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

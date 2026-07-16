@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bash-linux:
+    name: Bash and ShellCheck (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+      - name: Run behavior tests
+        run: bash tests/run.sh
+      - name: Parse Bash scripts
+        run: bash -n ./*.sh tests/*.sh
+      - name: Run ShellCheck
+        run: shellcheck ./*.sh tests/*.sh
+
+  bash-macos:
+    name: Bash 3.2 (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Show Bash version
+        run: bash --version
+      - name: Run behavior tests
+        run: bash tests/run.sh
+      - name: Parse Bash scripts
+        run: bash -n ./*.sh tests/*.sh
+
+  powershell7:
+    name: PowerShell 7 behavior
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run PowerShell behavior and parser tests
+        run: pwsh -NoLogo -NoProfile -NonInteractive -File tests/test_claude_code.ps1
+
+  windows-powershell:
+    name: Windows PowerShell 5.1 behavior
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run Windows PowerShell behavior and parser tests
+        shell: powershell
+        run: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/test_claude_code.ps1
