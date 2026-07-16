@@ -386,7 +386,8 @@ function New-RelativeSymbolicLink {
                 throw "Unsafe relative symbolic link target for cmd.exe mklink: $Target"
             }
 
-            $null = & cmd.exe /d /c mklink $leaf $Target 2>&1
+            $mklinkTarget = $Target.Replace('/', '\')
+            $null = & cmd.exe /d /c mklink $leaf $mklinkTarget 2>&1
             if ($LASTEXITCODE -ne 0) {
                 throw "cmd.exe mklink failed with exit code ${LASTEXITCODE}: $leaf -> $Target"
             }
