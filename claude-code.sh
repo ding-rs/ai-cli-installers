@@ -302,22 +302,53 @@ next_backup_path() {
   printf '%s\n' "$candidate"
 }
 
+resolve_write_target() {
+  local current link_target parent hops followed_link
+  current=$1
+  hops=0
+  followed_link=0
+
+  while [ -L "$current" ]; do
+    followed_link=1
+    hops=$((hops + 1))
+    [ "$hops" -le 32 ] || return 1
+    link_target=$(readlink "$current") || return 1
+    [ -n "$link_target" ] || return 1
+    case $link_target in
+      /*) current=$link_target ;;
+      *)
+        parent=${current%/*}
+        [ "$parent" != "$current" ] || parent=.
+        current=$parent/$link_target
+        ;;
+    esac
+  done
+
+  if [ "$followed_link" -eq 1 ] && [ ! -e "$current" ]; then
+    return 1
+  fi
+  printf '%s\n' "$current"
+}
+
 merge_claude_json() {
-  local config_file backup_file
+  local config_file config_target backup_file
   config_file=$HOME/.claude.json
+  if ! config_target=$(resolve_write_target "$config_file"); then
+    die 'Claude configuration symlink is broken or cyclic; the link was left unchanged'
+  fi
 
   if [ -e "$config_file" ] || [ -L "$config_file" ]; then
-    [ -f "$config_file" ] || die "$config_file is not a regular file"
+    [ -f "$config_target" ] || die "$config_file does not resolve to a regular file"
     backup_file=$(next_backup_path "$config_file")
-    cp -p -- "$config_file" "$backup_file" || die 'could not back up the existing Claude configuration'
+    cp -p -- "$config_target" "$backup_file" || die 'could not back up the existing Claude configuration'
     info 'Backed up the existing Claude configuration.'
   fi
 
-  TEMP_FILE="$config_file.ai-cli-installers.tmp.$$"
+  TEMP_FILE="$config_target.ai-cli-installers.tmp.$$"
   rm -f -- "$TEMP_FILE"
 
   if command -v node >/dev/null 2>&1; then
-    if ! node - "$config_file" "$TEMP_FILE" 2>/dev/null <<'NODE'
+    if ! node - "$config_target" "$TEMP_FILE" 2>/dev/null <<'NODE'
 const fs = require('fs');
 const source = process.argv[2];
 const destination = process.argv[3];
@@ -337,7 +368,7 @@ NODE
       die 'existing Claude configuration is not a valid JSON object; the original was left unchanged'
     fi
   elif command -v python3 >/dev/null 2>&1; then
-    if ! python3 - "$config_file" "$TEMP_FILE" 2>/dev/null <<'PYTHON'
+    if ! python3 - "$config_target" "$TEMP_FILE" 2>/dev/null <<'PYTHON'
 import json
 import os
 import sys
@@ -366,7 +397,7 @@ PYTHON
   fi
 
   chmod 600 "$TEMP_FILE" 2>/dev/null || true
-  mv -f -- "$TEMP_FILE" "$config_file" || die 'could not replace Claude configuration'
+  mv -f -- "$TEMP_FILE" "$config_target" || die 'could not replace Claude configuration'
   TEMP_FILE=
 }
 
@@ -403,20 +434,40 @@ shell_quote() {
 }
 
 update_shell_rc() {
-  local rc_file quoted_endpoint quoted_key
+  local rc_file rc_target quoted_endpoint quoted_key
   rc_file=$(choose_shell_rc)
+  if ! rc_target=$(resolve_write_target "$rc_file"); then
+    die 'shell rc symlink is broken or cyclic; the link was left unchanged'
+  fi
   quoted_endpoint=$(shell_quote "$endpoint")
   quoted_key=$(shell_quote "$api_key")
-  TEMP_FILE="$rc_file.ai-cli-installers.tmp.$$"
+  TEMP_FILE="$rc_target.ai-cli-installers.tmp.$$"
   rm -f -- "$TEMP_FILE"
 
-  if [ -f "$rc_file" ]; then
+  if [ -e "$rc_target" ]; then
+    [ -f "$rc_target" ] || die 'shell rc does not resolve to a regular file'
     if ! awk -v start="$BLOCK_START" -v end="$BLOCK_END" '
-      $0 == start { managed = 1; next }
-      $0 == end { managed = 0; next }
+      function invalid_layout() {
+        invalid = 1
+        exit 2
+      }
+      $0 == start {
+        if (managed || blocks > 0) invalid_layout()
+        managed = 1
+        blocks++
+        next
+      }
+      $0 == end {
+        if (!managed) invalid_layout()
+        managed = 0
+        next
+      }
       !managed { print }
-    ' "$rc_file" >"$TEMP_FILE"; then
-      die 'could not read the shell rc file'
+      END {
+        if (invalid || managed) exit 2
+      }
+    ' "$rc_target" >"$TEMP_FILE"; then
+      die 'shell rc has an invalid ai-cli-installers managed marker layout; the original was left unchanged'
     fi
   else
     : >"$TEMP_FILE" || die 'could not create a shell rc file'
@@ -430,7 +481,7 @@ update_shell_rc() {
   } >>"$TEMP_FILE" || die 'could not write the managed shell environment block'
 
   chmod 600 "$TEMP_FILE" 2>/dev/null || true
-  mv -f -- "$TEMP_FILE" "$rc_file" || die 'could not replace the shell rc file'
+  mv -f -- "$TEMP_FILE" "$rc_target" || die 'could not replace the shell rc file'
   TEMP_FILE=
   info "Updated the managed environment block in $rc_file."
 }

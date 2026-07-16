@@ -97,7 +97,7 @@ function Merge-ClaudeConfiguration {
     $config = [PSCustomObject]@{}
 
     if (Test-Path -LiteralPath $configPath) {
-        $configItem = Get-Item -LiteralPath $configPath
+        $configItem = Get-Item -LiteralPath $configPath -Force
         if ($configItem.PSIsContainer) {
             throw "Claude configuration path is not a file: $configPath"
         }
@@ -133,7 +133,7 @@ function Merge-ClaudeConfiguration {
         $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
         [System.IO.File]::WriteAllText($tempPath, $json + [Environment]::NewLine, $utf8WithoutBom)
         if (Test-Path -LiteralPath $configPath) {
-            [System.IO.File]::Replace($tempPath, $configPath, $null)
+            [System.IO.File]::Replace($tempPath, $configPath, $backupPath)
         }
         else {
             Move-Item -LiteralPath $tempPath -Destination $configPath -Force
@@ -147,18 +147,32 @@ function Merge-ClaudeConfiguration {
 }
 
 function Refresh-SessionPath {
+    $currentPath = $env:Path
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $pathParts = @()
 
-    if (-not [string]::IsNullOrWhiteSpace($machinePath)) {
-        $pathParts += $machinePath
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $pathComparer = [System.StringComparer]::OrdinalIgnoreCase
     }
-    if (-not [string]::IsNullOrWhiteSpace($userPath)) {
-        $pathParts += $userPath
+    else {
+        $pathComparer = [System.StringComparer]::Ordinal
     }
 
-    $env:Path = $pathParts -join [System.IO.Path]::PathSeparator
+    $seen = [System.Collections.Generic.HashSet[string]]::new($pathComparer)
+    $pathParts = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($sourcePath in @($currentPath, $machinePath, $userPath)) {
+        if ([string]::IsNullOrWhiteSpace($sourcePath)) {
+            continue
+        }
+
+        foreach ($entry in $sourcePath.Split([System.IO.Path]::PathSeparator)) {
+            if (-not [string]::IsNullOrWhiteSpace($entry) -and $seen.Add($entry)) {
+                $pathParts.Add($entry)
+            }
+        }
+    }
+
+    $env:Path = $pathParts.ToArray() -join [System.IO.Path]::PathSeparator
 }
 
 if (-not $PSBoundParameters.ContainsKey('Endpoint')) {

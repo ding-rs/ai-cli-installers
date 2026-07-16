@@ -63,6 +63,20 @@ assert_output_masks_key() {
   esac
 }
 
+assert_files_equal() {
+  if ! cmp -s "$1" "$2"; then
+    _test_failure "$3"
+  fi
+}
+
+assert_symlink_points_to() {
+  if [ ! -L "$1" ]; then
+    _test_failure "$3"
+  else
+    assert_eq "$2" "$(readlink "$1")" "$3"
+  fi
+}
+
 printf '%s\n' 'test: missing command invokes official installer and writes configuration'
 setup_fake_installer
 run_capture env AI_INSTALL_YES=1 bash "$SCRIPT" --endpoint "$ENDPOINT/" --key "$API_KEY"
@@ -119,6 +133,59 @@ run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" -y
 assert_success '-y alias succeeds'
 assert_output_masks_key 'configuration output does not reveal the full API key'
 
+printf '%s\n' 'test: unmatched managed start marker fails without changing shell rc content'
+setup_fake_installer
+cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
+RC_FILE=$(shell_rc_path)
+printf '%s\n' \
+  'export BEFORE_MARKER=keep' \
+  '# >>> ai-cli-installers >>>' \
+  'export AFTER_MARKER=keep' >"$RC_FILE"
+cp "$RC_FILE" "$SANDBOX/original-rc"
+run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
+assert_failure 'unmatched managed start marker causes a safe failure'
+assert_files_equal "$SANDBOX/original-rc" "$RC_FILE" 'unmatched managed start marker leaves the shell rc byte-for-byte unchanged'
+assert_output_masks_key 'unmatched-marker failure output masks the full API key'
+
+assert_invalid_marker_layout() {
+  local layout_name layout_content
+  layout_name=$1
+  layout_content=$2
+  setup_fake_installer
+  cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
+  RC_FILE=$(shell_rc_path)
+  printf '%s\n' "$layout_content" >"$RC_FILE"
+  cp "$RC_FILE" "$SANDBOX/original-rc"
+  run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
+  assert_failure "$layout_name managed marker layout causes a safe failure"
+  assert_files_equal "$SANDBOX/original-rc" "$RC_FILE" "$layout_name managed marker layout leaves the shell rc byte-for-byte unchanged"
+}
+
+printf '%s\n' 'test: malformed managed marker layouts fail without changing shell rc content'
+assert_invalid_marker_layout 'unmatched end' 'export BEFORE=keep
+# <<< ai-cli-installers <<<
+export AFTER=keep'
+assert_invalid_marker_layout 'reversed' 'export BEFORE=keep
+# <<< ai-cli-installers <<<
+# >>> ai-cli-installers >>>
+export AFTER=keep'
+assert_invalid_marker_layout 'nested' 'export BEFORE=keep
+# >>> ai-cli-installers >>>
+# >>> ai-cli-installers >>>
+export INSIDE=keep
+# <<< ai-cli-installers <<<
+# <<< ai-cli-installers <<<
+export AFTER=keep'
+assert_invalid_marker_layout 'duplicate' 'export BEFORE=keep
+# >>> ai-cli-installers >>>
+export FIRST=managed
+# <<< ai-cli-installers <<<
+export MIDDLE=keep
+# >>> ai-cli-installers >>>
+export SECOND=managed
+# <<< ai-cli-installers <<<
+export AFTER=keep'
+
 printf '%s\n' 'test: repeat run keeps one managed block and preserves unrelated JSON'
 setup_fake_installer
 cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
@@ -134,6 +201,68 @@ assert_file_contains "$HOME/.claude.json" '"theme": "dark"' 'JSON merge preserve
 assert_file_contains "$HOME/.claude.json" '"keep": 7' 'JSON merge preserves an unrelated nested field'
 assert_file_contains "$HOME/.claude.json" '"hasCompletedOnboarding": true' 'JSON merge updates onboarding'
 assert_file_contains "$HOME/.claude.json.ai-cli-installers.bak" '"theme":"dark"' 'existing JSON is backed up before its first change'
+
+printf '%s\n' 'test: relative config symlinks are preserved while their targets are updated'
+setup_fake_installer
+cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
+mkdir -p "$HOME/dotfiles"
+RC_FILE=$(shell_rc_path)
+RC_NAME=${RC_FILE##*/}
+RC_LINK_TARGET="dotfiles/$RC_NAME"
+printf '%s\n' 'export UNRELATED_RC=keep' >"$HOME/$RC_LINK_TARGET"
+ln -s "$RC_LINK_TARGET" "$RC_FILE"
+printf '%s\n' '{"theme":"symlinked","nested":{"keep":9}}' >"$HOME/dotfiles/claude.json"
+ln -s 'dotfiles/claude.json' "$HOME/.claude.json"
+run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
+assert_success 'relative config symlink update succeeds'
+assert_symlink_points_to "$RC_FILE" "$RC_LINK_TARGET" 'shell rc remains the original relative symlink'
+assert_symlink_points_to "$HOME/.claude.json" 'dotfiles/claude.json' 'Claude JSON remains the original relative symlink'
+assert_file_contains "$HOME/$RC_LINK_TARGET" 'export UNRELATED_RC=keep' 'symlinked shell rc target preserves unrelated content'
+assert_file_contains "$HOME/$RC_LINK_TARGET" "export ANTHROPIC_BASE_URL='$ENDPOINT'" 'symlinked shell rc target receives the managed block'
+assert_file_contains "$HOME/dotfiles/claude.json" '"theme": "symlinked"' 'symlinked JSON target preserves unrelated content'
+assert_file_contains "$HOME/dotfiles/claude.json" '"hasCompletedOnboarding": true' 'symlinked JSON target receives onboarding configuration'
+assert_file_contains "$HOME/.claude.json.ai-cli-installers.bak" '"theme":"symlinked"' 'symlinked JSON content is backed up before changing its target'
+
+printf '%s\n' 'test: broken and cyclic JSON symlinks fail without replacing the link'
+setup_fake_installer
+cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
+mkdir -p "$HOME/dotfiles"
+ln -s 'dotfiles/missing-claude.json' "$HOME/.claude.json"
+run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
+assert_failure 'broken Claude JSON symlink causes a safe failure'
+assert_symlink_points_to "$HOME/.claude.json" 'dotfiles/missing-claude.json' 'broken Claude JSON symlink is not replaced'
+assert_not_exists "$HOME/dotfiles/missing-claude.json" 'broken Claude JSON symlink target is not created'
+setup_fake_installer
+cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
+mkdir -p "$HOME/dotfiles"
+ln -s 'dotfiles/claude-cycle' "$HOME/.claude.json"
+ln -s '../.claude.json' "$HOME/dotfiles/claude-cycle"
+run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
+assert_failure 'cyclic Claude JSON symlink causes a safe failure'
+assert_symlink_points_to "$HOME/.claude.json" 'dotfiles/claude-cycle' 'cyclic Claude JSON symlink is not replaced'
+assert_symlink_points_to "$HOME/dotfiles/claude-cycle" '../.claude.json' 'cyclic Claude JSON link partner is not replaced'
+
+printf '%s\n' 'test: broken and cyclic shell rc symlinks fail without replacing the link'
+setup_fake_installer
+cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
+mkdir -p "$HOME/dotfiles"
+RC_FILE=$(shell_rc_path)
+ln -s 'dotfiles/missing-shell-rc' "$RC_FILE"
+run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
+assert_failure 'broken shell rc symlink causes a safe failure'
+assert_symlink_points_to "$RC_FILE" 'dotfiles/missing-shell-rc' 'broken shell rc symlink is not replaced'
+assert_not_exists "$HOME/dotfiles/missing-shell-rc" 'broken shell rc symlink target is not created'
+setup_fake_installer
+cp "$FAKE_BIN/installed-claude" "$FAKE_BIN/claude"
+mkdir -p "$HOME/dotfiles"
+RC_FILE=$(shell_rc_path)
+RC_NAME=${RC_FILE##*/}
+ln -s 'dotfiles/shell-rc-cycle' "$RC_FILE"
+ln -s "../$RC_NAME" "$HOME/dotfiles/shell-rc-cycle"
+run_capture bash "$SCRIPT" --endpoint "$ENDPOINT" --key "$API_KEY" --yes
+assert_failure 'cyclic shell rc symlink causes a safe failure'
+assert_symlink_points_to "$RC_FILE" 'dotfiles/shell-rc-cycle' 'cyclic shell rc symlink is not replaced'
+assert_symlink_points_to "$HOME/dotfiles/shell-rc-cycle" "../$RC_NAME" 'cyclic shell rc link partner is not replaced'
 
 printf '%s\n' 'test: malformed JSON is backed up and left unchanged'
 setup_fake_installer
