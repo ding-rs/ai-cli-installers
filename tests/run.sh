@@ -2,7 +2,7 @@
 
 set -u
 
-TEST_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+TEST_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 LC_ALL=C
 export LC_ALL
 

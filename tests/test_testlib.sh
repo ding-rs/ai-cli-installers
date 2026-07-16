@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 
 set -eu
 
-TEST_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+TEST_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+# shellcheck source=tests/testlib.sh
 . "$TEST_DIR/testlib.sh"
 
 original_home=${HOME-}
 new_sandbox
-
-assert_file_not_contains "$FAKE_BIN/hello" "anything" "missing fixture is reported" 2>/dev/null
 
 make_fake_command hello '#!/bin/sh
 printf "hello %s\n" "$1"'
@@ -20,6 +20,11 @@ assert_file_contains "$FAKE_BIN/hello" 'hello %s' "fixture contains expected tex
 assert_file_not_contains "$FAKE_BIN/hello" "goodbye" "fixture omits unexpected text"
 assert_not_exists "$HOME/not-created" "isolated home starts without unrelated files"
 
+assert_file_contains "$FAKE_BIN/hello" "goodbye" "missing text is reported" 2>/dev/null
+assert_file_not_contains "$FAKE_BIN/hello" 'hello %s' "unexpected text is reported" 2>/dev/null
+assert_eq "expected" "actual" "unequal values are reported" 2>/dev/null
+assert_not_exists "$FAKE_BIN/hello" "existing paths are reported" 2>/dev/null
+
 if [ -n "$original_home" ]; then
   if [ "$HOME" = "$original_home" ]; then
     printf 'not ok - new_sandbox did not isolate HOME\n' >&2
@@ -27,10 +32,12 @@ if [ -n "$original_home" ]; then
   fi
 fi
 
-# The first assertion intentionally failed because its fixture did not exist.
 observed_failures=$TEST_FAILURES
 TEST_FAILURES=0
-assert_eq "1" "$observed_failures" "failed assertions increment the failure counter"
+if [ "$observed_failures" -ne 4 ]; then
+  printf 'not ok - expected four failed assertions, got %s\n' "$observed_failures" >&2
+  TEST_FAILURES=$((TEST_FAILURES + 1))
+fi
 
 cp "$TEST_DIR/run.sh" "$FAKE_BIN/run.sh"
 make_fake_command test_20_second.sh '#!/bin/sh
@@ -53,6 +60,16 @@ printf "passing\n" >>"$HOME/order"'
 : >"$HOME/order"
 run_capture bash "$FAKE_BIN/run.sh"
 assert_eq "0" "$RUN_STATUS" "test runner succeeds when all tests pass"
+
+sandbox_to_remove=$SANDBOX
+make_fake_command rm '#!/bin/sh
+exit 0'
+cleanup_sandbox
+if [ -d "$sandbox_to_remove" ]; then
+  printf 'not ok - cleanup_sandbox used the sandbox fake rm\n' >&2
+  TEST_FAILURES=$((TEST_FAILURES + 1))
+fi
+/bin/rm -rf "$sandbox_to_remove"
 
 if [ "$TEST_FAILURES" -ne 0 ]; then
   exit 1

@@ -18,7 +18,7 @@ fi
 
 cleanup_sandbox() {
   if [ -n "$_TEST_SANDBOX_ROOT" ] && [ -d "$_TEST_SANDBOX_ROOT" ]; then
-    rm -rf "$_TEST_SANDBOX_ROOT"
+    /bin/rm -rf "$_TEST_SANDBOX_ROOT"
   fi
 
   _TEST_SANDBOX_ROOT=
@@ -79,6 +79,8 @@ run_capture() {
     return 0
   fi
 
+  # RUN_OUTPUT and RUN_STATUS are the public result variables for callers.
+  # shellcheck disable=SC2034
   if RUN_OUTPUT=$("$@" 2>&1); then
     RUN_STATUS=0
   else
@@ -112,7 +114,11 @@ assert_file_not_contains() {
 
 assert_eq() {
   if [ "$1" != "$2" ]; then
-    _test_failure "${3:-expected '$1', got '$2'}"
+    if [ "$#" -ge 3 ]; then
+      _test_failure "$3"
+    else
+      _test_failure "expected $1, got $2"
+    fi
   fi
   return 0
 }
