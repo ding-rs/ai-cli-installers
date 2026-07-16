@@ -11,7 +11,16 @@ BLOCK_END='# <<< ai-cli-installers codex <<<'
 CONFIG_TEMP=
 AUTH_TEMP=
 RC_TEMP=
+BACKUP_TEMP=
+ROLLBACK_TEMP=
 TTY_ECHO_DISABLED=0
+TRANSACTION_ACTIVE=0
+config_existed=0
+auth_existed=0
+rc_existed=0
+config_backup=
+auth_backup=
+rc_backup=
 
 usage() {
   cat <<EOF
@@ -52,9 +61,15 @@ restore_tty() {
 
 cleanup() {
   restore_tty
+  if [ "$TRANSACTION_ACTIVE" -eq 1 ]; then
+    TRANSACTION_ACTIVE=0
+    rollback_configuration || true
+  fi
   [ -z "$CONFIG_TEMP" ] || rm -f -- "$CONFIG_TEMP"
   [ -z "$AUTH_TEMP" ] || rm -f -- "$AUTH_TEMP"
   [ -z "$RC_TEMP" ] || rm -f -- "$RC_TEMP"
+  [ -z "$BACKUP_TEMP" ] || rm -f -- "$BACKUP_TEMP"
+  [ -z "$ROLLBACK_TEMP" ] || rm -f -- "$ROLLBACK_TEMP"
 }
 
 trap cleanup EXIT
@@ -258,7 +273,7 @@ validate_endpoint() {
     return 1
   fi
   case $endpoint in
-    *'?'*|*'#'*|*[[:space:]]*) return 1 ;;
+    *'?'*|*'#'*|*\\*|*[[:space:]]*) return 1 ;;
   esac
 
   case $endpoint in
@@ -349,6 +364,22 @@ make_temp_for_target() {
   target_name=${target_file##*/}
   [ "$target_dir" != "$target_file" ] || target_dir=.
   mktemp "$target_dir/.${target_name}.ai-cli-installers.tmp.XXXXXX"
+}
+
+create_private_backup() {
+  local source_file public_file result_variable candidate
+  source_file=$1
+  public_file=$2
+  result_variable=$3
+  candidate=$(next_backup_path "$public_file")
+  BACKUP_TEMP=$(mktemp "$candidate.ai-cli-installers.tmp.XXXXXX") || return 1
+  if ! /bin/cat <"$source_file" >"$BACKUP_TEMP"; then
+    return 1
+  fi
+  chmod 600 "$BACKUP_TEMP" || return 1
+  mv -f -- "$BACKUP_TEMP" "$candidate" || return 1
+  BACKUP_TEMP=
+  printf -v "$result_variable" '%s' "$candidate"
 }
 
 resolve_write_target() {
@@ -692,8 +723,7 @@ if (value === null || Array.isArray(value) || typeof value !== 'object') {
 }
 NODE
   then
-    auth_backup=$(next_backup_path "$auth_file")
-    cp -p -- "$auth_target" "$auth_backup" || die 'could not back up invalid Codex auth'
+    create_private_backup "$auth_target" "$auth_file" auth_backup || die 'could not back up invalid Codex auth privately'
     info 'Backed up the invalid Codex auth.'
     die 'existing Codex auth is not a valid JSON object; the original was left unchanged'
   fi
@@ -719,18 +749,18 @@ fi
 # All input files have now passed validation. Back up every existing file
 # before preparing or replacing any managed content.
 if [ -e "$auth_target" ]; then
-  auth_backup=$(next_backup_path "$auth_file")
-  cp -p -- "$auth_target" "$auth_backup" || die 'could not back up existing Codex auth'
+  auth_existed=1
+  create_private_backup "$auth_target" "$auth_file" auth_backup || die 'could not back up existing Codex auth privately'
   info 'Backed up the existing Codex auth.'
 fi
 if [ -e "$config_target" ]; then
-  config_backup=$(next_backup_path "$config_file")
-  cp -p -- "$config_target" "$config_backup" || die 'could not back up existing Codex config'
+  config_existed=1
+  create_private_backup "$config_target" "$config_file" config_backup || die 'could not back up existing Codex config privately'
   info 'Backed up the existing Codex config.'
 fi
 if [ -e "$rc_target" ]; then
-  rc_backup=$(next_backup_path "$rc_file")
-  cp -p -- "$rc_target" "$rc_backup" || die 'could not back up existing shell rc'
+  rc_existed=1
+  create_private_backup "$rc_target" "$rc_file" rc_backup || die 'could not back up existing shell rc privately'
   info 'Backed up the existing shell rc.'
 fi
 
@@ -796,12 +826,61 @@ quoted_key=$(shell_quote "$api_key")
   printf '%s\n' "$BLOCK_END"
 } >>"$RC_TEMP" || die 'could not write managed shell environment block'
 
+restore_private_file() {
+  local source_file target_file
+  source_file=$1
+  target_file=$2
+  ROLLBACK_TEMP=$(make_temp_for_target "$target_file") || return 1
+  if ! /bin/cat <"$source_file" >"$ROLLBACK_TEMP"; then
+    return 1
+  fi
+  chmod 600 "$ROLLBACK_TEMP" || return 1
+  mv -f -- "$ROLLBACK_TEMP" "$target_file" || return 1
+  ROLLBACK_TEMP=
+}
+
+rollback_configuration() {
+  local rollback_failed
+  rollback_failed=0
+  if [ "$config_existed" -eq 1 ]; then
+    restore_private_file "$config_backup" "$config_target" || rollback_failed=1
+  else
+    rm -f -- "$config_target" || rollback_failed=1
+  fi
+  if [ "$auth_existed" -eq 1 ]; then
+    restore_private_file "$auth_backup" "$auth_target" || rollback_failed=1
+  else
+    rm -f -- "$auth_target" || rollback_failed=1
+  fi
+  if [ "$rc_existed" -eq 1 ]; then
+    restore_private_file "$rc_backup" "$rc_target" || rollback_failed=1
+  else
+    rm -f -- "$rc_target" || rollback_failed=1
+  fi
+  if [ "$rollback_failed" -ne 0 ]; then
+    printf '%s\n' 'Error: configuration failed and automatic rollback was incomplete; retained private backups contain the original files' >&2
+  fi
+  return "$rollback_failed"
+}
+
+configuration_failed() {
+  local message
+  message=$1
+  TRANSACTION_ACTIVE=0
+  if rollback_configuration; then
+    die "$message; the original Codex configuration was restored"
+  fi
+  die "$message; automatic rollback was incomplete and the private backups were retained"
+}
+
 chmod 600 "$CONFIG_TEMP" "$AUTH_TEMP" "$RC_TEMP" 2>/dev/null || true
-mv -f -- "$CONFIG_TEMP" "$config_target" || die 'could not replace Codex config'
+TRANSACTION_ACTIVE=1
+mv -f -- "$CONFIG_TEMP" "$config_target" || configuration_failed 'could not replace Codex config'
 CONFIG_TEMP=
-mv -f -- "$AUTH_TEMP" "$auth_target" || die 'could not replace Codex auth'
+mv -f -- "$AUTH_TEMP" "$auth_target" || configuration_failed 'could not replace Codex auth'
 AUTH_TEMP=
-mv -f -- "$RC_TEMP" "$rc_target" || die 'could not replace shell rc'
+mv -f -- "$RC_TEMP" "$rc_target" || configuration_failed 'could not replace shell rc'
 RC_TEMP=
+TRANSACTION_ACTIVE=0
 
 info 'Codex CLI configuration is ready; the API key was stored without being displayed.'

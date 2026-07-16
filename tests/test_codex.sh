@@ -167,6 +167,33 @@ printf "%s\n" "$*" >>"$FAKE_MKTEMP_LOG"
 /usr/bin/mktemp "$@"'
 }
 
+setup_failing_managed_move() {
+  make_fake_command mv '#!/bin/sh
+source_path=
+destination_path=
+for candidate in "$@"; do
+  case $candidate in
+    -*) ;;
+    *)
+      if [ -z "$source_path" ]; then source_path=$candidate; else destination_path=$candidate; fi
+      ;;
+  esac
+done
+case $destination_path in
+  "$HOME/.codex/config.toml"|"$HOME/.codex/auth.json"|"$HOME/.bashrc"|"$HOME/.zshrc")
+    count=0
+    [ ! -f "$SANDBOX/managed-move-count" ] || count=$(cat "$SANDBOX/managed-move-count")
+    count=$((count + 1))
+    printf "%s\n" "$count" >"$SANDBOX/managed-move-count"
+    if [ "$count" -eq "$FAKE_MV_FAIL_AT" ] && [ ! -e "$SANDBOX/managed-move-failed" ]; then
+      : >"$SANDBOX/managed-move-failed"
+      exit 73
+    fi
+    ;;
+esac
+/bin/mv "$@"'
+}
+
 assert_success() {
   assert_eq '0' "$RUN_STATUS" "$1"
 }
@@ -590,6 +617,30 @@ assert_eq '0' "$(wc -c <"$FAKE_NPM_LOG" | tr -d ' ')" 'control-character endpoin
 assert_not_exists "$HOME/.codex" 'control-character endpoint does not write configuration'
 assert_output_masks_key 'control-character endpoint failure masks key'
 
+printf '%s\n' 'test: dry-run rejects every representable C0/DEL byte and path backslashes without side effects'
+for CONTROL_CODE in \
+  1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
+  17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 127
+do
+  setup_fake_codex
+  # shellcheck disable=SC2059
+  printf -v CONTROL_CHAR "\\$(printf '%03o' "$CONTROL_CODE")"
+  CONTROL_ENDPOINT="https://api.example.test/v1${CONTROL_CHAR}hidden"
+  run_capture /bin/bash "$SCRIPT" --endpoint "$CONTROL_ENDPOINT" --key "$API_KEY" --dry-run --yes
+  assert_failure "dry-run rejects endpoint control byte $CONTROL_CODE"
+  assert_eq '0' "$(wc -c <"$FAKE_NPM_LOG" | tr -d ' ')" "control byte $CONTROL_CODE does not install"
+  assert_not_exists "$HOME/.codex" "control byte $CONTROL_CODE creates no Codex config"
+  assert_not_exists "$(shell_rc_path)" "control byte $CONTROL_CODE creates no shell rc"
+  assert_output_masks_key "control byte $CONTROL_CODE failure masks key"
+done
+setup_fake_codex
+run_capture /bin/bash "$SCRIPT" --endpoint 'https://api.example.test/v1\evil' --key "$API_KEY" --dry-run --yes
+assert_failure 'dry-run rejects a backslash in the endpoint path'
+assert_eq '0' "$(wc -c <"$FAKE_NPM_LOG" | tr -d ' ')" 'path-backslash endpoint does not install'
+assert_not_exists "$HOME/.codex" 'path-backslash endpoint creates no Codex config'
+assert_not_exists "$(shell_rc_path)" 'path-backslash endpoint creates no shell rc'
+assert_output_masks_key 'path-backslash endpoint failure masks key'
+
 printf '%s\n' 'test: auth JSON merge preserves unrelated fields, backs up, and stays idempotent'
 setup_fake_codex
 cp "$FAKE_BIN/installed-codex" "$FAKE_BIN/codex"
@@ -608,11 +659,56 @@ assert_file_contains "$HOME/.codex/auth.json" "\"OPENAI_API_KEY\": \"$API_KEY\""
 assert_file_contains "$HOME/.codex/auth.json.ai-cli-installers.bak" '"OPENAI_API_KEY":"old"' 'existing auth is backed up before changing'
 assert_files_equal "$SANDBOX/original-shell-rc" "$(shell_rc_path).ai-cli-installers.bak" 'first shell rc backup contains the original rc bytes'
 assert_files_equal "$SANDBOX/first-managed-shell-rc" "$(shell_rc_path).ai-cli-installers.bak.1" 'repeat run backs up the first managed rc result to a unique path'
+assert_mode_600 "$HOME/.codex/auth.json.ai-cli-installers.bak" 'auth backup is owner-only even when the source was broader'
+assert_mode_600 "$(shell_rc_path).ai-cli-installers.bak" 'shell rc backup is owner-only even when the source was broader'
+assert_mode_600 "$(shell_rc_path).ai-cli-installers.bak.1" 'repeat shell rc backup remains owner-only'
 assert_eq '1' "$(grep -c "^$CODEX_BLOCK_START$" "$HOME/.codex/config.toml")" 'repeat run leaves one config managed block'
 assert_eq '1' "$(grep -c "^$CODEX_BLOCK_START$" "$(shell_rc_path)")" 'repeat run leaves one shell managed block'
 assert_eq '1' "$(grep -c '^export OPENAI_API_KEY=' "$(shell_rc_path)")" 'repeat run leaves one key export'
 assert_file_contains "$(shell_rc_path)" 'export UNRELATED=safe' 'shell merge preserves unrelated content'
 assert_output_masks_key 'repeat-run output masks the full key'
+
+printf '%s\n' 'test: each managed replacement failure restores existing files byte-for-byte and retains private backups'
+for FAIL_AT in 1 2 3; do
+  setup_fake_codex
+  cp "$FAKE_BIN/installed-codex" "$FAKE_BIN/codex"
+  setup_failing_managed_move
+  mkdir -p "$HOME/.codex"
+  printf '%s\n' "approval_policy = \"original-$FAIL_AT\"" >"$HOME/.codex/config.toml"
+  printf '%s\n' "{\"OPENAI_API_KEY\":\"old-$FAIL_AT\",\"keep\":true}" >"$HOME/.codex/auth.json"
+  printf '%s\n' "export ORIGINAL_RC_$FAIL_AT=keep" >"$(shell_rc_path)"
+  chmod 644 "$HOME/.codex/config.toml" "$HOME/.codex/auth.json" "$(shell_rc_path)"
+  cp "$HOME/.codex/config.toml" "$SANDBOX/original-config"
+  cp "$HOME/.codex/auth.json" "$SANDBOX/original-auth"
+  cp "$(shell_rc_path)" "$SANDBOX/original-rc"
+  run_capture env FAKE_MV_FAIL_AT="$FAIL_AT" AI_INSTALL_YES=1 /bin/bash "$SCRIPT" \
+    --endpoint "$ENDPOINT" --key "$API_KEY"
+  assert_failure "managed replacement $FAIL_AT failure is reported"
+  assert_files_equal "$SANDBOX/original-config" "$HOME/.codex/config.toml" "replacement $FAIL_AT failure restores config bytes"
+  assert_files_equal "$SANDBOX/original-auth" "$HOME/.codex/auth.json" "replacement $FAIL_AT failure restores auth bytes"
+  assert_files_equal "$SANDBOX/original-rc" "$(shell_rc_path)" "replacement $FAIL_AT failure restores shell rc bytes"
+  assert_files_equal "$SANDBOX/original-config" "$HOME/.codex/config.toml.ai-cli-installers.bak" "replacement $FAIL_AT retains config backup"
+  assert_files_equal "$SANDBOX/original-auth" "$HOME/.codex/auth.json.ai-cli-installers.bak" "replacement $FAIL_AT retains auth backup"
+  assert_files_equal "$SANDBOX/original-rc" "$(shell_rc_path).ai-cli-installers.bak" "replacement $FAIL_AT retains rc backup"
+  assert_mode_600 "$HOME/.codex/config.toml.ai-cli-installers.bak" "replacement $FAIL_AT config backup is owner-only"
+  assert_mode_600 "$HOME/.codex/auth.json.ai-cli-installers.bak" "replacement $FAIL_AT auth backup is owner-only"
+  assert_mode_600 "$(shell_rc_path).ai-cli-installers.bak" "replacement $FAIL_AT rc backup is owner-only"
+  assert_output_masks_key "replacement $FAIL_AT failure masks key"
+done
+
+printf '%s\n' 'test: each managed replacement failure removes files that were absent before the transaction'
+for FAIL_AT in 1 2 3; do
+  setup_fake_codex
+  cp "$FAKE_BIN/installed-codex" "$FAKE_BIN/codex"
+  setup_failing_managed_move
+  run_capture env FAKE_MV_FAIL_AT="$FAIL_AT" AI_INSTALL_YES=1 /bin/bash "$SCRIPT" \
+    --endpoint "$ENDPOINT" --key "$API_KEY"
+  assert_failure "empty-state managed replacement $FAIL_AT failure is reported"
+  assert_not_exists "$HOME/.codex/config.toml" "replacement $FAIL_AT removes newly created config"
+  assert_not_exists "$HOME/.codex/auth.json" "replacement $FAIL_AT removes newly created auth"
+  assert_not_exists "$(shell_rc_path)" "replacement $FAIL_AT removes newly created shell rc"
+  assert_output_masks_key "empty-state replacement $FAIL_AT failure masks key"
+done
 
 printf '%s\n' 'test: malformed auth JSON is backed up and left unchanged'
 setup_fake_codex
