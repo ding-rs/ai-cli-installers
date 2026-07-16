@@ -264,6 +264,40 @@ function Copy-ToPrivateFile {
     Write-BytesToPrivateFile -Path $Destination -Bytes $bytes
 }
 
+function Get-PathEntryFromParent {
+    param([string]$Path)
+
+    $parent = Split-Path -Parent $Path
+    $leaf = Split-Path -Leaf $Path
+    if ([string]::IsNullOrWhiteSpace($parent) -or [string]::IsNullOrWhiteSpace($leaf)) {
+        return $null
+    }
+
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $nameComparer = [System.StringComparer]::OrdinalIgnoreCase
+    }
+    else {
+        $nameComparer = [System.StringComparer]::Ordinal
+    }
+
+    try {
+        $entries = @(Get-ChildItem -LiteralPath $parent -Force -ErrorAction Stop)
+    }
+    catch {
+        if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
+            return $null
+        }
+        throw
+    }
+
+    foreach ($entry in $entries) {
+        if ($nameComparer.Equals($entry.Name, $leaf)) {
+            return $entry
+        }
+    }
+    return $null
+}
+
 function Resolve-ClaudeConfigurationPath {
     param([string]$HomePath)
 
@@ -289,16 +323,21 @@ function Resolve-ClaudeConfigurationPath {
         }
         catch {
             if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
-                if ($followedLink) {
-                    throw 'Claude configuration symlink is broken; no installation or configuration was changed.'
-                }
-                return [PSCustomObject]@{
-                    LogicalPath = $logicalPath
-                    TargetPath = $currentPath
-                    Existed = $false
+                $item = Get-PathEntryFromParent -Path $currentPath
+                if ($null -eq $item) {
+                    if ($followedLink) {
+                        throw 'Claude configuration symlink is broken; no installation or configuration was changed.'
+                    }
+                    return [PSCustomObject]@{
+                        LogicalPath = $logicalPath
+                        TargetPath = $currentPath
+                        Existed = $false
+                    }
                 }
             }
-            throw
+            else {
+                throw
+            }
         }
 
         $isReparsePoint = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0

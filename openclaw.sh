@@ -400,13 +400,19 @@ if [ -e "$secret_file" ] && [ ! -f "$secret_file" ]; then
   die 'the managed OpenClaw secret must be a regular file'
 fi
 if [ -e "$OPENCLAW_STATE_DIR" ]; then
-  [ -d "$OPENCLAW_STATE_DIR" ] && [ -w "$OPENCLAW_STATE_DIR" ] || die 'OPENCLAW_STATE_DIR must be a writable directory'
+  if [ ! -d "$OPENCLAW_STATE_DIR" ] || [ ! -w "$OPENCLAW_STATE_DIR" ]; then
+    die 'OPENCLAW_STATE_DIR must be a writable directory'
+  fi
 fi
 if [ -e "$config_parent" ]; then
-  [ -d "$config_parent" ] && [ -w "$config_parent" ] || die 'the OpenClaw config parent must be a writable directory'
+  if [ ! -d "$config_parent" ] || [ ! -w "$config_parent" ]; then
+    die 'the OpenClaw config parent must be a writable directory'
+  fi
 fi
 if [ -e "$secrets_dir" ] || [ -L "$secrets_dir" ]; then
-  [ -d "$secrets_dir" ] && [ -w "$secrets_dir" ] || die 'the OpenClaw secrets path must be a writable directory'
+  if [ ! -d "$secrets_dir" ] || [ ! -w "$secrets_dir" ]; then
+    die 'the OpenClaw secrets path must be a writable directory'
+  fi
 fi
 
 verify_active_config() {

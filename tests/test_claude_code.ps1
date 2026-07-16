@@ -211,6 +211,25 @@ function Assert-PrivateFile {
     }
 }
 
+function Get-TestPathEntryFromParent {
+    param([string]$Path)
+
+    $parent = Split-Path -Parent $Path
+    $leaf = Split-Path -Leaf $Path
+    if ($script:IsWindowsPlatform) {
+        $nameComparer = [System.StringComparer]::OrdinalIgnoreCase
+    }
+    else {
+        $nameComparer = [System.StringComparer]::Ordinal
+    }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $parent -Force -ErrorAction Stop)) {
+        if ($nameComparer.Equals($entry.Name, $leaf)) {
+            return $entry
+        }
+    }
+    return $null
+}
+
 function Assert-SymbolicLinkTarget {
     param(
         [string]$Path,
@@ -219,7 +238,10 @@ function Assert-SymbolicLinkTarget {
     )
 
     try {
-        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $item = Get-TestPathEntryFromParent -Path $Path
+        if ($null -eq $item) {
+            throw "Link entry is missing: $Path"
+        }
         $isLink = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
         $target = [string]$item.Target
         Assert-True -Condition ($isLink -and $target -ceq $ExpectedTarget) -Message $Message
@@ -342,7 +364,11 @@ function New-RelativeSymbolicLink {
     finally {
         Pop-Location
     }
-    return [string](Get-Item -LiteralPath $Path -Force).Target
+    $linkItem = Get-TestPathEntryFromParent -Path $Path
+    if ($null -eq $linkItem) {
+        throw "Created link entry is missing: $Path"
+    }
+    return [string]$linkItem.Target
 }
 
 function New-TestSandbox {

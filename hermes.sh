@@ -423,7 +423,9 @@ else
     [ -n "$next_parent" ] || next_parent=/
     home_parent=$next_parent
   done
-  [ -d "$home_parent" ] && [ -w "$home_parent" ] || die 'HERMES_HOME cannot be created under its nearest existing parent'
+  if [ ! -d "$home_parent" ] || [ ! -w "$home_parent" ]; then
+    die 'HERMES_HOME cannot be created under its nearest existing parent'
+  fi
 fi
 
 if ! config_target=$(resolve_write_target "$config_file"); then
